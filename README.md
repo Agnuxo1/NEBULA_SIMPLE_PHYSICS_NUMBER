@@ -1,6 +1,30 @@
 # NEBULA_SIMPLE_PHYSICS_NUMBER
 
-# RSNA Intracranial Aneurysm Detection - Optical Neural Network
+## Digit Recognizer - Optical Neural Network
+
+Este repositorio incluye ahora una red neuronal óptica escrita en C++ para el reto **Digit Recognizer** de Kaggle. Proporciona utilidades de entrenamiento e inferencia y puede generar el `submission.csv` requerido por el benchmark.
+
+### Compilación
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
+### Entrenamiento
+
+```bash
+./train path/to/train.csv model.bin 1 0.01
+```
+
+### Generar submission
+
+```bash
+./generate_submission model.bin path/to/test.csv submission.csv
+```
+
+## RSNA Intracranial Aneurysm Detection - Optical Neural Network
 
 Este proyecto implementa una red neuronal óptica para la detección de aneurismas intracraneales en el concurso RSNA, utilizando interferómetros Mach-Zehnder en lugar de tecnologías convencionales como CNNs o transformers.
 
@@ -20,7 +44,7 @@ SIMPLE_PHYSICS_RSNA2/
 ├── main01.exe             # Ejecutable compilado
 ├── create_train_mips.py   # Script para generar train_mips.csv
 ├── setup_rsna.bat         # Configuración inicial
-├── run_rsna_train.bat     # Entrenamiento
+├── run_rsna_train_full.bat     # Entrenamiento
 ├── run_rsna_infer.bat     # Inferencia
 ├── mips/                  # Imágenes MIP generadas
 ├── ckpt_front/           # Checkpoints red front

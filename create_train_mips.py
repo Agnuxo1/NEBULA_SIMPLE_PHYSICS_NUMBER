@@ -138,10 +138,10 @@ def create_mips(volume):
     # Back view (coronal invertida)
     mips['back'] = np.max(volume, axis=1)[::-1, :]
     
-    # Left view (sagital) - proyección máxima en X
+    # Left view (sagittal) - proyección máxima en X
     mips['left'] = np.max(volume, axis=2)
-    
-    # Right view (sagital invertida)
+
+    # Right view (sagittal invertida)
     mips['right'] = np.max(volume, axis=2)[:, ::-1]
     
     return mips
@@ -158,8 +158,8 @@ def save_as_pgm(image_array, filename):
     # Crear directorio si no existe
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
-    # Guardar como PGM usando imageio, especificando el formato binario P5
-    imageio.imwrite(filename, img_uint8, format='pgm', flags='-P5')
+    # Guardar como PGM usando imageio en formato binario por defecto
+    imageio.imwrite(filename, img_uint8, format='pgm')
 
 def find_dicom_files(series_dir):
     """Encuentra todos los archivos DICOM en un directorio"""

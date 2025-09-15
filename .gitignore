@@ -1,0 +1,11 @@
+/build/
+*.o
+*.a
+*.exe
+*.dll
+*.lib
+*.pdb
+*.exp
+*.out
+*.pyc
+__pycache__/
