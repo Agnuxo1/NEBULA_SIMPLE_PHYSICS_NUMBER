@@ -18,9 +18,10 @@ $env:MAX_TRAIN_SAMPLES = "$TrainSamples"
 $env:MAX_TEST_SAMPLES  = "$TestSamples"
 
 $workdir = $PSScriptRoot
-$exe = Join-Path $workdir 'SIMPLE_PHYSICS_NUMBERS01_NEW.exe'
+$exe = Join-Path $workdir 'SIMPLE_PHYSICS_NUMBERS03_NEW.exe'
+if (-not (Test-Path $exe)) { $exe = Join-Path $workdir 'SIMPLE_PHYSICS_NUMBERS01_NEW.exe' }
 if (-not (Test-Path $exe)) { $exe = Join-Path $workdir 'SIMPLE_PHYSICS_NUMBERS_NEW.exe' }
-if (-not (Test-Path $exe)) { $exe = Join-Path $workdir '..\SIMPLE_PHYSICS_NUMBERS01_NEW.exe' }
+if (-not (Test-Path $exe)) { $exe = Join-Path $workdir '..\SIMPLE_PHYSICS_NUMBERS03_NEW.exe' }
 if (-not (Test-Path $exe)) { throw "Executable not found next to project root." }
 
 Write-Host "[run_quick_test] Launching: $exe with timeout $TimeoutSeconds s"

@@ -1,5 +1,5 @@
 /*
- * NEBULA NUMBER EMERGENT - Kaggle Digit Recognizer Edition
+ * NEBULA PHYSICS EMERGENT - RSNA Intracranial Aneurysm Detection Edition
 
  * Author: Francisco Angulo de Lafuente (Model Made in 2023)
 
@@ -8,13 +8,14 @@
  * - Optical matrix multiplication (Feldmann et al. 2019)
  * - Photonic neural computing (Lin et al. 2018)
  * 
- * Target: Kaggle Digit Recognizer Competition
- * - Train on 42,000 labeled samples
- * - Predict 28,000 test samples
- * - Output: submission.csv for Kaggle
+ * Target: RSNA Intracranial Aneurysm Detection Competition
+ * - Train on medical CT scan MIP images (4 views: front, back, left, right)
+ * - Predict aneurysm presence in intracranial arteries
+ * - Output: JSON predictions for 14 arteries + global detection
  * 
- * Architecture: 784→512→256→128→10 optical neurons
+ * Architecture: 784→512→256→128→2 optical neurons (binary classification)
  * Learning: Hebbian plasticity + physical clustering
+ * Multi-expert: 4 specialized networks for different viewing angles
  */
 
 
@@ -36,6 +37,10 @@
 #include <iomanip>
 #include <numeric>
 #include <cmath>
+#include <filesystem>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 
 // ============================================================================ 
 // PHYSICAL CONSTANTS & OPTICAL STRUCTURES
@@ -211,86 +216,370 @@ inline void cudaCheckLastKernel(const char* kernel_name, const char* file, int l
 #define CUDA_LAUNCH_CHECK(KERNEL_NAME) cudaCheckLastKernel(KERNEL_NAME, __FILE__, __LINE__)
 
 // ============================================================================ 
-// DATA LOADER
+// IMAGE UTILS (CPU): robust PGM load and image formalization to 28x28
 // ============================================================================ 
 
-class KaggleDigitLoader {
+static bool load_pgm_as_gray(const std::string& path, std::vector<float>& out, int& w, int& h) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        printf("LOAD_PGM_FAIL: fopen() returned null. Cannot open file. Path: '%s'\n", path.c_str());
+        return false;
+    }
+
+    char magic[3] = {0};
+    if (std::fread(magic, 1, 2, f) != 2) {
+        printf("LOAD_PGM_FAIL: fread() for magic number failed. File too small? Path: '%s'\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    if (magic[0] != 'P' || (magic[1] != '5' && magic[1] != '2')) {
+        printf("LOAD_PGM_FAIL: Incorrect magic number. Expected P2 or P5, got '%c%c'. Path: '%s'\n", magic[0], magic[1], path.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    auto skip_ws_comments = [&](){
+        int c = std::fgetc(f);
+        while (c == '#') { while (c != '\n' && c != EOF) c = std::fgetc(f); c = std::fgetc(f); }
+        while (c==' '||c=='\t'||c=='\r'||c=='\n') c = std::fgetc(f);
+        std::ungetc(c, f);
+    };
+
+    skip_ws_comments();
+    int maxval = 0;
+    if (std::fscanf(f, "%d %d", &w, &h) != 2) {
+        printf("LOAD_PGM_FAIL: fscanf() for dimensions (width, height) failed. Path: '%s'\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    skip_ws_comments();
+    if (std::fscanf(f, "%d", &maxval) != 1) {
+        printf("LOAD_PGM_FAIL: fscanf() for maxval failed. Path: '%s'\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    if (maxval <= 0) {
+        printf("LOAD_PGM_FAIL: maxval is <= 0. Path: '%s'\n", path.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    std::fgetc(f);
+    out.resize((size_t)w * (size_t)h);
+
+    if (magic[1] == '5') {
+        if (maxval < 256) {
+            std::vector<unsigned char> buf((size_t)w * (size_t)h);
+            size_t want = buf.size();
+            size_t got  = std::fread(buf.data(), 1, want, f);
+            if (got < want) {
+                printf("LOAD_PGM_FAIL: fread() for pixel data failed. Expected %zu bytes, got %zu. Path: '%s'\n", want, got, path.c_str());
+                std::fclose(f);
+                return false;
+            }
+            for (size_t i = 0; i < want; ++i) out[i] = buf[i] / (float)maxval;
+        } else {
+            std::vector<unsigned char> buf((size_t)w * (size_t)h * 2);
+            size_t want = buf.size();
+            size_t got  = std::fread(buf.data(), 1, want, f);
+            if (got < want) { 
+                printf("LOAD_PGM_FAIL: 16-bit fread() for pixel data failed. Expected %zu bytes, got %zu. Path: '%s'\n", want, got, path.c_str());
+                std::fclose(f); 
+                return false; 
+            }
+            for (size_t i = 0, j = 0; i < (size_t)w*(size_t)h; ++i, j+=2) {
+                unsigned short v = (unsigned short)buf[j] << 8 | (unsigned short)buf[j+1];
+                out[i] = v / (float)maxval;
+            }
+        }
+    } else {
+        for (int i = 0; i < w*h; ++i) {
+            int val=0; 
+            if (std::fscanf(f, "%d", &val) != 1) {
+                printf("LOAD_PGM_FAIL: ASCII fscanf() for pixel data failed at pixel %d. Path: '%s'\n", i, path.c_str());
+                std::fclose(f); 
+                return false; 
+            }
+            out[i] = val / (float)maxval;
+        }
+    }
+
+    std::fclose(f);
+    return true;
+}
+
+static std::string trim_and_normalize_path(std::string p) {
+    auto is_space = [](char c){ return c==' ' || c=='\t' || c=='\r' || c=='\n'; };
+    while (!p.empty() && is_space(p.front())) p.erase(p.begin());
+    while (!p.empty() && is_space(p.back())) p.pop_back();
+    if (!p.empty() && (p.front()=='"' || p.front()=='\'')) p.erase(p.begin());
+    if (!p.empty() && (p.back()=='"' || p.back()=='\'')) p.pop_back();
+#if defined(_WIN32)
+    std::replace(p.begin(), p.end(), '/', '\\');
+#endif
+    return p;
+}
+
+static std::vector<float> resize_nn_to_28x28(const std::vector<float>& img, int w, int h) {
+    const int TW = 28, TH = 28;
+    std::vector<float> out(TW * TH, 0.0f);
+    for (int y = 0; y < TH; ++y) {
+        int sy = (int)std::round((y + 0.5f) * h / (float)TH - 0.5f);
+        if (sy < 0) sy = 0; if (sy >= h) sy = h-1;
+        for (int x = 0; x < TW; ++x) {
+            int sx = (int)std::round((x + 0.5f) * w / (float)TW - 0.5f);
+            if (sx < 0) sx = 0; if (sx >= w) sx = w-1;
+            out[y*TW + x] = img[sy * w + sx];
+        }
+    }
+    return out;
+}
+
+static std::vector<float> resize_bl_to_28x28(const std::vector<float>& img, int w, int h) {
+    const int TW = 28, TH = 28;
+    std::vector<float> out(TW*TH, 0.0f);
+    for (int y=0; y<TH; ++y) {
+        float gy = ((y + 0.5f) * h / (float)TH - 0.5f);
+        int y0 = (int)floorf(gy); int y1 = y0 + 1; float wy = gy - y0;
+        if (y0 < 0) { y0 = 0; y1 = 0; wy = 0; } if (y1 >= h) { y1 = h-1; y0 = y1; wy = 0; }
+        for (int x=0; x<TW; ++x) {
+            float gx = ((x + 0.5f) * w / (float)TW - 0.5f);
+            int x0 = (int)floorf(gx); int x1 = x0 + 1; float wx = gx - x0;
+            if (x0 < 0) { x0=0; x1=0; wx=0; } if (x1 >= w) { x1=w-1; x0=x1; wx=0; }
+            float v00 = img[y0*w + x0];
+            float v01 = img[y0*w + x1];
+            float v10 = img[y1*w + x0];
+            float v11 = img[y1*w + x1];
+            float v0 = v00*(1-wx) + v01*wx;
+            float v1 = v10*(1-wx) + v11*wx;
+            out[y*TW + x] = v0*(1-wy) + v1*wy;
+        }
+    }
+    return out;
+}
+
+static std::vector<float> formalize_and_resize_to_28x28(const std::vector<float>& img, int w, int h) {
+    if (img.empty() || w <= 1 || h <= 1) return std::vector<float>(28*28, 0.0f);
+    // Clipping + min-max normalize
+    float mn = img[0], mx = img[0];
+    for (size_t i=1;i<img.size();++i){ float v=img[i]; if (!std::isfinite(v)) continue; if (v<mn) mn=v; if (v>mx) mx=v; }
+    float denom = (mx - mn); if (denom <= 1e-8f) denom = 1.0f;
+    std::vector<float> tmp(img.size());
+    for (size_t i=0;i<img.size();++i){ float v=img[i]; if (!std::isfinite(v)) v=0.0f; v=(v-mn)/denom; if (v<0) v=0; if (v>1) v=1; tmp[i]=v; }
+    return resize_bl_to_28x28(tmp, w, h);
+}
+
+// ============================================================================
+// DATA LOADER (RSNA Challenge)
+// ============================================================================
+
+// Structure to hold info from the RSNA train.csv
+struct RSNA_Sample {
+    std::string series_uid;
+    float label; // 0.0 or 1.0 for binary classification
+};
+
+class RSNAAneurysmLoader {
 private:
-    std::vector<std::vector<float>> train_images;
-    std::vector<int> train_labels;
-    std::vector<std::vector<float>> test_images;
-    
+    std::vector<RSNA_Sample> train_samples;
+    std::string data_root_dir;
+
 public:
-    bool loadTrainData(const std::string& filepath) {
-        std::ifstream file(filepath);
+    RSNAAneurysmLoader(const std::string& root_dir = ".") : data_root_dir(root_dir) {}
+
+    bool loadTrainData(const std::string& csv_filepath) {
+        std::ifstream file(csv_filepath);
         if (!file.is_open()) {
-            std::cerr << "Cannot open train file: " << filepath << std::endl;
+            std::cerr << "Cannot open train CSV file: " << csv_filepath << std::endl;
             return false;
         }
-        
+
         std::string line;
         std::getline(file, line); // Skip header
-        
+
         size_t max_samples = SIZE_MAX;
         if (const char* env_ts = std::getenv("MAX_TRAIN_SAMPLES")) {
             try { max_samples = std::stoul(env_ts); } catch (...) { max_samples = SIZE_MAX; }
         }
-        
+
         while (std::getline(file, line)) {
             std::stringstream ss(line);
             std::string cell;
-            
-            std::getline(ss, cell, ',');
-            int label = std::stoi(cell);
-            train_labels.push_back(label);
-            
-            std::vector<float> image(784);
-            for (int i = 0; i < 784; i++) {
-                std::getline(ss, cell, ',');
-                image[i] = std::stof(cell) / 255.0f;
+            RSNA_Sample sample;
+
+            // 1. SeriesInstanceUID
+            std::getline(ss, sample.series_uid, ',');
+
+            // Skip intermediate columns until we get to the last one
+            for (int i = 0; i < 17; ++i) {
+                if (!std::getline(ss, cell, ',')) break;
             }
-            train_images.push_back(image);
-            if (train_images.size() >= max_samples) break;
+            
+            // 18. Aneurysm Present (the label)
+            try {
+                sample.label = std::stof(cell);
+            } catch (...) {
+                // Handle cases where conversion might fail
+                continue; 
+            }
+
+            train_samples.push_back(sample);
+            if (train_samples.size() >= max_samples) break;
         }
-        
+
         file.close();
-        std::cout << "Loaded " << train_images.size() << " training samples" << std::endl;
-        return true;
+        std::cout << "Loaded " << train_samples.size() << " training sample records from " << csv_filepath << std::endl;
+        return !train_samples.empty();
     }
-    
-    bool loadTestData(const std::string& filepath) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            std::cerr << "Cannot open test file: " << filepath << std::endl;
+
+    // Method to get a pre-processed image and its label for a given index
+    bool getTrainSample(size_t index, std::vector<float>& out_image_28x28, float& out_label) {
+        if (index >= train_samples.size()) return false;
+
+        const auto& sample = train_samples[index];
+        out_label = sample.label;
+
+        // Construct the path to the image file (assuming PGM in mips folder)
+        std::string image_path_str = data_root_dir + "/mips/" + sample.series_uid + ".pgm";
+        
+        // Check if file exists before trying to load
+        if (!std::filesystem::exists(image_path_str)) {
+             // Fallback to trying .png if .pgm is not found
+            image_path_str = data_root_dir + "/mips/" + sample.series_uid + ".png";
+            if (!std::filesystem::exists(image_path_str)) {
+                // std::cerr << "Warning: Image file not found for UID " << sample.series_uid << std::endl;
+                return false; // Skip this sample if image is not found
+            }
+        }
+
+        std::vector<float> raw_image;
+        int w, h;
+        // For now, we assume a function that can handle png/jpg might be needed
+        // The existing `load_pgm_as_gray` is a good start.
+        if (!load_pgm_as_gray(image_path_str, raw_image, w, h)) {
+            // std::cerr << "Warning: Failed to load image " << image_path_str << std::endl;
             return false;
         }
-        
-        std::string line;
-        std::getline(file, line); // Skip header
-        
-        size_t max_samples = SIZE_MAX;
-        if (const char* env_ts = std::getenv("MAX_TEST_SAMPLES")) {
-            try { max_samples = std::stoul(env_ts); } catch (...) { max_samples = SIZE_MAX; }
-        }
-        
-        while (std::getline(file, line)) {
-            std::stringstream ss(line);
-            std::string cell;
-            
-            std::vector<float> image(784);
-            for (int i = 0; i < 784; i++) {
-                std::getline(ss, cell, ',');
-                image[i] = std::stof(cell) / 255.0f;
-            }
-            test_images.push_back(image);
-            if (test_images.size() >= max_samples) break;
-        }
-        
-        file.close();
-        std::cout << "Loaded " << test_images.size() << " test samples" << std::endl;
+
+        if (raw_image.empty()) return false;
+
+        // Resize the loaded image to the network's input size (28x28)
+        out_image_28x28 = resize_nn_to_28x28(raw_image, w, h);
         return true;
     }
-    
+
+    size_t getTrainCount() const { return train_samples.size(); }
+    const std::vector<RSNA_Sample>& getTrainSamples() const { return train_samples; }
+};
+
+// ============================================================================
+// LEGACY DIGITS DATA LOADER (MNIST/Kaggle Digit Recognizer CSV)
+// ---------------------------------------------------------------------------
+// Minimal implementation to satisfy legacy training path when enabled via
+// environment variable LEGACY_DIGITS=1. Not used for RSNA flows.
+// ----------------------------------------------------------------------------
+class KaggleDigitLoader {
+private:
+    std::vector<std::vector<float>> train_images; // each size 784 normalized to [0,1]
+    std::vector<int> train_labels;                // 0..9
+    std::vector<std::vector<float>> test_images;  // each size 784
+
+    static bool parse_csv_row(const std::string& line, std::vector<int>& out_vals) {
+        out_vals.clear();
+        out_vals.reserve(785);
+        std::stringstream ss(line);
+        std::string cell;
+        while (std::getline(ss, cell, ',')) {
+            try { out_vals.push_back(std::stoi(cell)); }
+            catch (...) { return false; }
+        }
+        return !out_vals.empty();
+    }
+
+public:
+    bool loadTrainData(const std::string& csv_path) {
+        std::ifstream f(csv_path);
+        if (!f.is_open()) {
+            std::cerr << "Cannot open train CSV: " << csv_path << std::endl;
+            return false;
+        }
+        train_images.clear();
+        train_labels.clear();
+        std::string line;
+        // Skip header if present
+        if (std::getline(f, line)) {
+            if (line.find("label") == std::string::npos) {
+                // first line is data; process it
+                std::vector<int> vals;
+                if (parse_csv_row(line, vals)) {
+                    if (!vals.empty()) {
+                        int label = vals[0];
+                        std::vector<float> img(784, 0.0f);
+                        for (size_t i = 1; i < vals.size() && i <= 784; ++i) {
+                            img[i-1] = std::clamp(vals[i] / 255.0f, 0.0f, 1.0f);
+                        }
+                        train_labels.push_back(label);
+                        train_images.push_back(std::move(img));
+                    }
+                }
+            }
+        }
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::vector<int> vals;
+            if (!parse_csv_row(line, vals)) continue;
+            if (vals.empty()) continue;
+            int label = vals[0];
+            std::vector<float> img(784, 0.0f);
+            for (size_t i = 1; i < vals.size() && i <= 784; ++i) {
+                img[i-1] = std::clamp(vals[i] / 255.0f, 0.0f, 1.0f);
+            }
+            train_labels.push_back(label);
+            train_images.push_back(std::move(img));
+        }
+        std::cout << "Loaded digits train: images=" << train_images.size() << std::endl;
+        return !train_images.empty();
+    }
+
+    bool loadTestData(const std::string& csv_path) {
+        std::ifstream f(csv_path);
+        if (!f.is_open()) {
+            std::cerr << "Cannot open test CSV: " << csv_path << std::endl;
+            return false;
+        }
+        test_images.clear();
+        std::string line;
+        // Skip header if present (no label column expected here)
+        if (std::getline(f, line)) {
+            if (line.find("pixel") == std::string::npos) {
+                // first line is data; process it
+                std::vector<int> vals;
+                if (parse_csv_row(line, vals)) {
+                    std::vector<float> img(784, 0.0f);
+                    for (size_t i = 0; i < vals.size() && i < 784; ++i) {
+                        img[i] = std::clamp(vals[i] / 255.0f, 0.0f, 1.0f);
+                    }
+                    test_images.push_back(std::move(img));
+                }
+            }
+        }
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::vector<int> vals;
+            if (!parse_csv_row(line, vals)) continue;
+            std::vector<float> img(784, 0.0f);
+            for (size_t i = 0; i < vals.size() && i < 784; ++i) {
+                img[i] = std::clamp(vals[i] / 255.0f, 0.0f, 1.0f);
+            }
+            test_images.push_back(std::move(img));
+        }
+        std::cout << "Loaded digits test: images=" << test_images.size() << std::endl;
+        return !test_images.empty();
+    }
+
     const std::vector<std::vector<float>>& getTrainImages() const { return train_images; }
     const std::vector<int>& getTrainLabels() const { return train_labels; }
     const std::vector<std::vector<float>>& getTestImages() const { return test_images; }
@@ -395,7 +684,8 @@ __global__ void forwardPassLayerKernel(OpticalNeuron* all_neurons_batch, const O
                                        int num_neurons,
                                        const int* incoming_indices, const int* incoming_offsets,
                                        int layer_start, int layer_size,
-                                       float dt, int batch_size) {
+                                       float dt, int batch_size,
+                                       int use_max_plus, float li_alpha) {
     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int sample_idx = global_idx / layer_size;
     int idx_in_layer = global_idx % layer_size;
@@ -407,7 +697,7 @@ __global__ void forwardPassLayerKernel(OpticalNeuron* all_neurons_batch, const O
     OpticalNeuron& neuron = neurons[neuron_idx];
 
     // Reset and accumulate only from incoming synapses
-    neuron.potential = 0.0f;
+    float acc = use_max_plus ? -1.0e9f : 0.0f;
     Complex total_field(0.0f, 0.0f);
     int start = incoming_offsets[neuron_idx];
     int end   = incoming_offsets[neuron_idx + 1];
@@ -416,8 +706,13 @@ __global__ void forwardPassLayerKernel(OpticalNeuron* all_neurons_batch, const O
         int s = incoming_indices[idx];
         const OpticalSynapse& syn = synapses[s];
         const OpticalNeuron& pre = neurons[syn.pre_neuron_id];
-        float signal_strength = pre.activation * syn.weight;
-        neuron.potential += signal_strength;
+        if (use_max_plus) {
+            float candidate = pre.activation + syn.weight;
+            acc = fmaxf(acc, candidate);
+        } else {
+            float signal_strength = pre.activation * syn.weight;
+            acc += signal_strength;
+        }
         Complex weighted_field = pre.field_amplitude * syn.weight;
         total_field = total_field + weighted_field;
         connections++;
@@ -426,9 +721,86 @@ __global__ void forwardPassLayerKernel(OpticalNeuron* all_neurons_batch, const O
     if (connections > 0) {
         float norm_factor = rsqrtf((float)connections + 1e-3f); // 1/sqrt
         // Normalize potential to avoid activation saturation with large fan-in
-        neuron.potential *= norm_factor;
+        neuron.potential = acc;
+        if (!use_max_plus) {
+            neuron.potential *= norm_factor;
+        }
+        // Simple per-neuron inhibition proxy (no cross-thread reduction): shrink towards zero
+        if (li_alpha > 0.0f) {
+            neuron.potential -= li_alpha * neuron.potential;
+        }
         neuron.activation = tanhf(neuron.potential);
         neuron.field_amplitude = total_field * norm_factor;
+    }
+}
+
+// Apply K-Winners-Take-All per layer (keep top-k activations, zero the rest) per sample.
+__global__ void applyKWTAKernel(OpticalNeuron* all_neurons_batch,
+                                int num_neurons, int layer_start, int layer_size,
+                                int batch_size, int k_keep) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size || k_keep <= 0) return;
+
+    if (threadIdx.x == 0) {
+        int base = sample_idx * num_neurons + layer_start;
+        if (k_keep > layer_size) k_keep = layer_size;
+
+        bool selected_local[1024];
+        for (int i = 0; i < layer_size; ++i) selected_local[i] = false;
+
+        for (int sel = 0; sel < k_keep; ++sel) {
+            int best_i = -1; float best_v = -1.0e9f;
+            for (int i = 0; i < layer_size; ++i) {
+                if (selected_local[i]) continue;
+                float v = all_neurons_batch[base + i].activation;
+                if (v > best_v) { best_v = v; best_i = i; }
+            }
+            if (best_i >= 0) selected_local[best_i] = true; else break;
+        }
+
+        for (int i = 0; i < layer_size; ++i) {
+            if (!selected_local[i]) {
+                all_neurons_batch[base + i].activation = 0.0f;
+                all_neurons_batch[base + i].potential = 0.0f;
+                all_neurons_batch[base + i].field_amplitude = Complex(0.0f, 0.0f);
+            } else {
+                float a = fmaxf(0.0f, all_neurons_batch[base + i].activation);
+                all_neurons_batch[base + i].field_amplitude = Complex(sqrtf(a), 0.0f);
+            }
+        }
+    }
+}
+
+// Apply in-place Fast Walsh-Hadamard Transform on a layer per sample.
+__global__ void applyHadamardKernel(OpticalNeuron* all_neurons_batch,
+                                    int num_neurons, int layer_start, int layer_size,
+                                    int batch_size) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+    if ((layer_size & (layer_size - 1)) != 0) return; // require power of two
+
+    if (threadIdx.x == 0) {
+        int base = sample_idx * num_neurons + layer_start;
+        for (int len = 1; len < layer_size; len <<= 1) {
+            for (int i = 0; i < layer_size; i += (len << 1)) {
+                for (int j = 0; j < len; ++j) {
+                    int i0 = base + i + j;
+                    int i1 = base + i + j + len;
+                    float u = all_neurons_batch[i0].activation;
+                    float v = all_neurons_batch[i1].activation;
+                    all_neurons_batch[i0].activation = u + v;
+                    all_neurons_batch[i1].activation = u - v;
+                }
+            }
+        }
+        float norm = rsqrtf((float)layer_size);
+        for (int i = 0; i < layer_size; ++i) {
+            int idx = base + i;
+            all_neurons_batch[idx].activation *= norm;
+            all_neurons_batch[idx].potential = all_neurons_batch[idx].activation;
+            float a = fmaxf(0.0f, all_neurons_batch[idx].activation);
+            all_neurons_batch[idx].field_amplitude = Complex(sqrtf(a), 0.0f);
+        }
     }
 }
 
@@ -830,7 +1202,7 @@ __global__ void updateMZIPhasesFromTargets(const OpticalNeuron* all_neurons_batc
 
 class OpticalNeuralNetwork {
 public:
-    static constexpr int BATCH_SIZE = 32;
+    static constexpr int BATCH_SIZE = 128;
 
 private:
     // Architecture
@@ -858,6 +1230,14 @@ private:
     // Hyperparameters (host-configurable)
     float logit_gain;         // scaling for output logits
     float mzi_phase_lr;       // learning rate for MZI phase updates
+    
+    // Non-conventional feature toggles
+    int   use_max_plus_hidden;   // 1: max-plus accumulation on hidden layers
+    int   use_hadamard;          // 1: apply Hadamard mixing after hidden layers
+    int   use_kwta;              // 1: apply K-Winners-Take-All after hidden layers
+    int   kwta_keep_hidden;      // number of winners to keep (if >0)
+    float kwta_frac_hidden;      // fraction of winners to keep (if kwta_keep_hidden==0)
+    float li_alpha_hidden;       // simple inhibition shrink factor [0..1] for hidden layers
     
     // Output MZI mesh parameters (Clements-style alternating pairs)
     float* d_mzi_theta;       // phase shifts per pair
@@ -895,7 +1275,13 @@ public:
         epoch(0),
         global_step(0),
         logit_gain(1.5f),
-        mzi_phase_lr(0.002f) {
+        mzi_phase_lr(0.002f),
+        use_max_plus_hidden(0),
+        use_hadamard(0),
+        use_kwta(0),
+        kwta_keep_hidden(0),
+        kwta_frac_hidden(0.0f),
+        li_alpha_hidden(0.0f) {
         
         // Override hyperparameters via environment variables if provided
         if (const char* s = std::getenv("LEARNING_RATE_INIT")) {
@@ -912,6 +1298,24 @@ public:
         }
         if (const char* s = std::getenv("MZI_PHASE_LR")) {
             try { mzi_phase_lr = std::stof(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("USE_MAX_PLUS")) {
+            try { use_max_plus_hidden = std::stoi(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("USE_HADAMARD")) {
+            try { use_hadamard = std::stoi(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("USE_KWTA")) {
+            try { use_kwta = std::stoi(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("KWTA_KEEP")) {
+            try { kwta_keep_hidden = std::stoi(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("KWTA_FRAC")) {
+            try { kwta_frac_hidden = std::stof(s); } catch (...) {}
+        }
+        if (const char* s = std::getenv("LI_ALPHA")) {
+            try { li_alpha_hidden = std::stof(s); } catch (...) {}
         }
 
         // Define architecture
@@ -980,6 +1384,42 @@ public:
         CUDA_CHECK(cudaMemcpy(d_mzi_path_diff,  h_path.data(),  h_path.size()  * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_mzi_coherence_len,  h_cohl.data(),  h_cohl.size()  * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_mzi_stage_offsets, stage_offsets.data(), stage_offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+    }
+
+    // Save only synapse weights to a simple binary file.
+    bool saveWeights(const std::string& dir, const std::string& filename = "weights.bin") {
+        namespace fs = std::filesystem;
+        try { fs::create_directories(fs::path(dir)); } catch (...) {}
+        std::vector<OpticalSynapse> h_syn(num_synapses);
+        CUDA_CHECK(cudaMemcpy(h_syn.data(), d_synapses, num_synapses * sizeof(OpticalSynapse), cudaMemcpyDeviceToHost));
+        std::vector<float> w(num_synapses);
+        for (int i = 0; i < num_synapses; ++i) w[i] = h_syn[i].weight;
+        std::ofstream f(fs::path(dir) / filename, std::ios::binary);
+        if (!f.is_open()) return false;
+        int n = num_synapses;
+        f.write(reinterpret_cast<const char*>(&n), sizeof(int));
+        f.write(reinterpret_cast<const char*>(w.data()), n * sizeof(float));
+        return true;
+    }
+
+    // Load synapse weights from binary file saved by saveWeights.
+    bool loadWeights(const std::string& filepath) {
+        std::ifstream f(filepath, std::ios::binary);
+        if (!f.is_open()) return false;
+        int n_file = 0;
+        f.read(reinterpret_cast<char*>(&n_file), sizeof(int));
+        if (n_file != num_synapses) {
+            std::cerr << "Checkpoint mismatch: expected " << num_synapses << ", got " << n_file << std::endl;
+            return false;
+        }
+        std::vector<float> w(n_file);
+        f.read(reinterpret_cast<char*>(w.data()), n_file * sizeof(float));
+        if (!f) return false;
+        std::vector<OpticalSynapse> h_syn(num_synapses);
+        CUDA_CHECK(cudaMemcpy(h_syn.data(), d_synapses, num_synapses * sizeof(OpticalSynapse), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < num_synapses; ++i) h_syn[i].weight = w[i];
+        CUDA_CHECK(cudaMemcpy(d_synapses, h_syn.data(), num_synapses * sizeof(OpticalSynapse), cudaMemcpyHostToDevice));
+        return true;
     }
     
     ~OpticalNeuralNetwork() {
@@ -1177,8 +1617,8 @@ private:
     
     void initializeRandomStates() {
         const int total_threads = BATCH_SIZE * TOTAL_NEURONS;
-        dim3 blocks((total_threads + 255) / 256);
-        dim3 threads(256);
+        dim3 blocks((total_threads + 511) / 512);
+        dim3 threads(512);
         
         initRandomStates<<<blocks, threads, 0, compute_stream>>>(
             d_rand_states, time(nullptr), total_threads);
@@ -1260,58 +1700,102 @@ public:
             const int layer_start = layer_offsets[1];
             const int layer_size  = layer_sizes[1];
             const int total = BATCH_SIZE * layer_size;
-            dim3 blocks((total + 255) / 256);
-            dim3 threads(256);
+            dim3 blocks((total + 511) / 512);
+            dim3 threads(512);
             forwardPassLayerKernel<<<blocks, threads, 0, compute_stream>>>(
                 d_neurons, d_synapses, TOTAL_NEURONS,
                 d_incoming_indices, d_incoming_offsets,
                 layer_start, layer_size,
-                dt, BATCH_SIZE
+                dt, BATCH_SIZE,
+                use_max_plus_hidden, li_alpha_hidden
             );
             CUDA_LAUNCH_CHECK("forwardPassLayerKernel_H1");
+            // Optional mixing and sparsification
+            if (use_hadamard) {
+                applyHadamardKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE
+                );
+                CUDA_LAUNCH_CHECK("applyHadamardKernel_H1");
+            }
+            if (use_kwta) {
+                int k = kwta_keep_hidden > 0 ? kwta_keep_hidden : max(1, (int)(layer_size * kwta_frac_hidden));
+                applyKWTAKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE, k
+                );
+                CUDA_LAUNCH_CHECK("applyKWTAKernel_H1");
+            }
         }
         // 2) Hidden2
         {
             const int layer_start = layer_offsets[2];
             const int layer_size  = layer_sizes[2];
             const int total = BATCH_SIZE * layer_size;
-            dim3 blocks((total + 255) / 256);
-            dim3 threads(256);
+            dim3 blocks((total + 511) / 512);
+            dim3 threads(512);
             forwardPassLayerKernel<<<blocks, threads, 0, compute_stream>>>(
                 d_neurons, d_synapses, TOTAL_NEURONS,
                 d_incoming_indices, d_incoming_offsets,
                 layer_start, layer_size,
-                dt, BATCH_SIZE
+                dt, BATCH_SIZE,
+                use_max_plus_hidden, li_alpha_hidden
             );
             CUDA_LAUNCH_CHECK("forwardPassLayerKernel_H2");
+            if (use_hadamard) {
+                applyHadamardKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE
+                );
+                CUDA_LAUNCH_CHECK("applyHadamardKernel_H2");
+            }
+            if (use_kwta) {
+                int k = kwta_keep_hidden > 0 ? kwta_keep_hidden : max(1, (int)(layer_size * kwta_frac_hidden));
+                applyKWTAKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE, k
+                );
+                CUDA_LAUNCH_CHECK("applyKWTAKernel_H2");
+            }
         }
         // 3) Hidden3
         {
             const int layer_start = layer_offsets[3];
             const int layer_size  = layer_sizes[3];
             const int total = BATCH_SIZE * layer_size;
-            dim3 blocks((total + 255) / 256);
-            dim3 threads(256);
+            dim3 blocks((total + 511) / 512);
+            dim3 threads(512);
             forwardPassLayerKernel<<<blocks, threads, 0, compute_stream>>>(
                 d_neurons, d_synapses, TOTAL_NEURONS,
                 d_incoming_indices, d_incoming_offsets,
                 layer_start, layer_size,
-                dt, BATCH_SIZE
+                dt, BATCH_SIZE,
+                use_max_plus_hidden, li_alpha_hidden
             );
             CUDA_LAUNCH_CHECK("forwardPassLayerKernel_H3");
+            if (use_hadamard) {
+                applyHadamardKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE
+                );
+                CUDA_LAUNCH_CHECK("applyHadamardKernel_H3");
+            }
+            if (use_kwta) {
+                int k = kwta_keep_hidden > 0 ? kwta_keep_hidden : max(1, (int)(layer_size * kwta_frac_hidden));
+                applyKWTAKernel<<<BATCH_SIZE, 256, 0, compute_stream>>>(
+                    d_neurons, TOTAL_NEURONS, layer_start, layer_size, BATCH_SIZE, k
+                );
+                CUDA_LAUNCH_CHECK("applyKWTAKernel_H3");
+            }
         }
         // 4) Output layer
         {
             const int layer_start = layer_offsets[4];
             const int layer_size  = layer_sizes[4];
             const int total = BATCH_SIZE * layer_size;
-            dim3 blocks((total + 255) / 256);
-            dim3 threads(256);
+            dim3 blocks((total + 511) / 512);
+            dim3 threads(512);
             forwardPassLayerKernel<<<blocks, threads, 0, compute_stream>>>(
                 d_neurons, d_synapses, TOTAL_NEURONS,
                 d_incoming_indices, d_incoming_offsets,
                 layer_start, layer_size,
-                dt, BATCH_SIZE
+                dt, BATCH_SIZE,
+                0, 0.0f
             );
             CUDA_LAUNCH_CHECK("forwardPassLayerKernel_OUT");
         }
@@ -1319,8 +1803,8 @@ public:
         // Optional: clustering for visualization occasionally
         if (epoch % 100 == 0) {
             const int total_neuron_instances = BATCH_SIZE * TOTAL_NEURONS;
-            dim3 neuron_blocks((total_neuron_instances + 255) / 256);
-            dim3 neuron_threads(256);
+            dim3 neuron_blocks((total_neuron_instances + 511) / 512);
+            dim3 neuron_threads(512);
             clusterNeuronsKernel<<<neuron_blocks, neuron_threads, 0, compute_stream>>>(
                 d_neurons, TOTAL_NEURONS, 1e-8f, dt, BATCH_SIZE
             );
@@ -1329,14 +1813,14 @@ public:
 
         bool dbg_optics = (std::getenv("DEBUG_OPTICS") != nullptr);
         if (dbg_optics) {
-            computeOutputEnergy<<<(BATCH_SIZE + 255)/256, 256, 0, compute_stream>>>(
+            computeOutputEnergy<<<(BATCH_SIZE + 511)/512, 512, 0, compute_stream>>>(
                 d_neurons, TOTAL_NEURONS, BATCH_SIZE, layer_offsets.back(), OUTPUT_SIZE, d_temp_energy
             );
             CUDA_LAUNCH_CHECK("computeOutputEnergy_pre");
         }
 
         // Apply output MZI mesh mixing on field amplitudes of the output layer
-        applyOutputMZIMesh<<<(BATCH_SIZE + 255)/256, 256, 0, compute_stream>>>(
+        applyOutputMZIMesh<<<(BATCH_SIZE + 511)/512, 512, 0, compute_stream>>>(
             d_neurons, TOTAL_NEURONS, BATCH_SIZE, layer_offsets.back(), OUTPUT_SIZE,
             d_mzi_theta, d_mzi_phi, d_mzi_visibility, d_mzi_loss, d_mzi_path_diff, d_mzi_coherence_len,
             d_mzi_stage_offsets, mzi_num_stages, d_rand_states, logit_gain
@@ -1345,7 +1829,7 @@ public:
 
         if (dbg_optics) {
             // compute post-mesh energy and print summary
-            computeOutputEnergy<<<(BATCH_SIZE + 255)/256, 256, 0, compute_stream>>>(
+            computeOutputEnergy<<<(BATCH_SIZE + 511)/512, 512, 0, compute_stream>>>(
                 d_neurons, TOTAL_NEURONS, BATCH_SIZE, layer_offsets.back(), OUTPUT_SIZE, d_temp_energy
             );
             CUDA_LAUNCH_CHECK("computeOutputEnergy_post");
@@ -1404,7 +1888,7 @@ public:
         loadInputBatch(inputs);
         forward(dt);
         // Read output activations for loss/grad computation
-        getOutputActivationsKernel<<<(BATCH_SIZE * OUTPUT_SIZE + 255)/256, 256, 0, compute_stream>>>(
+        getOutputActivationsKernel<<<(BATCH_SIZE * OUTPUT_SIZE + 511)/512, 512, 0, compute_stream>>>(
             d_neurons, d_output_activations, TOTAL_NEURONS, OUTPUT_SIZE, BATCH_SIZE, layer_offsets.back()
         );
         CUDA_LAUNCH_CHECK("getOutputActivationsKernel");
@@ -1436,7 +1920,7 @@ public:
         float* d_output_gradients = nullptr;
         CUDA_CHECK(cudaMalloc(&d_output_gradients, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
         CUDA_CHECK(cudaMemcpy(d_output_gradients, output_gradients.data(), BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-        applyOutputGradients<<<(BATCH_SIZE * OUTPUT_SIZE + 255)/256, 256, 0, compute_stream>>>(
+        applyOutputGradients<<<(BATCH_SIZE * OUTPUT_SIZE + 511)/512, 512, 0, compute_stream>>>(
             d_neurons, d_output_gradients, TOTAL_NEURONS, OUTPUT_SIZE, actual_bs, layer_offsets.back(), learning_rate
         );
         CUDA_LAUNCH_CHECK("applyOutputGradients");
@@ -1460,8 +1944,8 @@ public:
         }
 
         // Calculate weight updates (averaged per batch inside the kernel)
-        dim3 delta_blocks((num_synapses + 255) / 256);
-        dim3 delta_threads(256);
+        dim3 delta_blocks((num_synapses + 511) / 512);
+        dim3 delta_threads(512);
         calculateWeightDeltasKernel<<<delta_blocks, delta_threads, 0, compute_stream>>>(
             d_synapses, d_neurons, num_synapses, TOTAL_NEURONS, 
             learning_rate, dt, d_delta_weights, actual_bs
@@ -1469,8 +1953,8 @@ public:
         CUDA_LAUNCH_CHECK("calculateWeightDeltasKernel");
 
         // Apply weight updates with momentum (no extra averaging here)
-        dim3 apply_blocks((num_synapses + 255) / 256);
-        dim3 apply_threads(256);
+        dim3 apply_blocks((num_synapses + 511) / 512);
+        dim3 apply_threads(512);
         applyWeightUpdatesKernel<<<apply_blocks, apply_threads, 0, compute_stream>>>(
             d_synapses, d_delta_weights, d_momentum_velocities, num_synapses, momentum
         );
@@ -1519,6 +2003,84 @@ public:
         
         return prediction;
     }
+
+    // Train on binary target using output neuron 0 as logit (BCE with logits)
+    float trainBatchBinary(const std::vector<std::vector<float>>& inputs,
+                           const std::vector<float>& targets,
+                           float dt = 0.01f) {
+        loadInputBatch(inputs);
+        forward(dt);
+
+        // Gather logits (potentials)
+        getOutputActivationsKernel<<<(BATCH_SIZE * OUTPUT_SIZE + 511)/512, 512, 0, compute_stream>>>(
+            d_neurons, d_output_activations, TOTAL_NEURONS, OUTPUT_SIZE, BATCH_SIZE, layer_offsets.back()
+        );
+        CUDA_LAUNCH_CHECK("getOutputActivationsKernel_Binary");
+        std::vector<float> batch_logits(BATCH_SIZE * OUTPUT_SIZE);
+        CUDA_CHECK(cudaMemcpy(batch_logits.data(), d_output_activations, batch_logits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+        const int actual_bs = static_cast<int>(inputs.size());
+        std::vector<float> output_gradients(BATCH_SIZE * OUTPUT_SIZE, 0.0f);
+        float total_loss = 0.0f;
+        for (int b = 0; b < actual_bs; ++b) {
+            float logit = batch_logits[b * OUTPUT_SIZE + 0];
+            float y = targets[b];
+            float p = 1.0f / (1.0f + expf(-logit));
+            total_loss += -(y * logf(p + 1e-8f) + (1.0f - y) * logf(1.0f - p + 1e-8f));
+            output_gradients[b * OUTPUT_SIZE + 0] = (p - y);
+        }
+
+        float* d_output_gradients = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_output_gradients, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_output_gradients, output_gradients.data(), BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+        applyOutputGradients<<<(BATCH_SIZE * OUTPUT_SIZE + 511)/512, 512, 0, compute_stream>>>(
+            d_neurons, d_output_gradients, TOTAL_NEURONS, OUTPUT_SIZE, actual_bs, layer_offsets.back(), learning_rate
+        );
+        CUDA_LAUNCH_CHECK("applyOutputGradients_Binary");
+        CUDA_CHECK(cudaFree(d_output_gradients));
+
+        dim3 delta_blocks((num_synapses + 511) / 512);
+        dim3 delta_threads(512);
+        calculateWeightDeltasKernel<<<delta_blocks, delta_threads, 0, compute_stream>>>(
+            d_synapses, d_neurons, num_synapses, TOTAL_NEURONS, 
+            learning_rate, dt, d_delta_weights, actual_bs
+        );
+        CUDA_LAUNCH_CHECK("calculateWeightDeltasKernel_Binary");
+
+        dim3 apply_blocks((num_synapses + 511) / 512);
+        dim3 apply_threads(512);
+        applyWeightUpdatesKernel<<<apply_blocks, apply_threads, 0, compute_stream>>>(
+            d_synapses, d_delta_weights, d_momentum_velocities, num_synapses, momentum
+        );
+        CUDA_LAUNCH_CHECK("applyWeightUpdatesKernel_Binary");
+
+        const int total_neuron_instances = BATCH_SIZE * TOTAL_NEURONS;
+        dim3 neuron_blocks((total_neuron_instances + 255) / 256);
+        dim3 neuron_threads(256);
+        temperatureAnnealingKernel<<<neuron_blocks, neuron_threads, 0, compute_stream>>>(
+            d_neurons, TOTAL_NEURONS, 0.999f, 0.5f, BATCH_SIZE, epoch
+        );
+        CUDA_LAUNCH_CHECK("temperatureAnnealingKernel_Binary");
+
+        global_step++;
+        if (global_step % 100 == 0 && global_step > 0) {
+            learning_rate *= 0.99f;
+            learning_rate = fmaxf(1e-4f, learning_rate);
+        }
+
+        return total_loss / std::max(1, actual_bs);
+    }
+
+    // Convenience: forward on a single 28x28 image; return output activations for sample 0
+    std::vector<float> inferSingle(const std::vector<float>& input28x28) {
+        std::vector<std::vector<float>> batch(BATCH_SIZE, std::vector<float>(INPUT_SIZE, 0.0f));
+        int copy_n = (int)std::min<size_t>(input28x28.size(), (size_t)INPUT_SIZE);
+        std::copy(input28x28.begin(), input28x28.begin() + copy_n, batch[0].begin());
+        loadInputBatch(batch);
+        forward();
+        auto outs = getOutputBatch();
+        return outs[0];
+    }
     
     void printStatus() {
         std::cout << "Epoch: " << epoch 
@@ -1542,10 +2104,20 @@ private:
     OpticalNeuralNetwork& network;
     KaggleDigitLoader& loader;
     std::vector<float> loss_history;
+    std::string ckpt_dir;
+    bool save_best;
     
 public:
     Trainer(OpticalNeuralNetwork& net, KaggleDigitLoader& data) 
-        : network(net), loader(data) {}
+        : network(net), loader(data), save_best(false) {
+        if (const char* s = std::getenv("CKPT_DIR")) {
+            ckpt_dir = s;
+        }
+        if (const char* s = std::getenv("SAVE_BEST_CKPT")) {
+            try { save_best = std::stoi(s) != 0; } catch (...) { save_best = true; }
+        }
+    }
+
     
     void trainEpoch() {
         const auto& train_images = loader.getTrainImages();
@@ -1618,6 +2190,16 @@ public:
         float avg_loss = total_loss / batches;
         loss_history.push_back(avg_loss);
         
+        // Save best checkpoint if requested
+        if (save_best && !loss_history.empty()) {
+            bool improved = loss_history.size() == 1 || loss_history.back() <= *std::min_element(loss_history.begin(), loss_history.end()-1);
+            if (improved && !ckpt_dir.empty()) {
+                std::string best_path = ckpt_dir;
+                if (best_path.back() == '/' || best_path.back() == '\\') best_path.pop_back();
+                network.saveWeights(best_path, "best.bin");
+            }
+        }
+
         // CRITICAL: Only increment epoch HERE, not in trainBatch
         network.incrementEpoch();
         
@@ -1691,7 +2273,7 @@ public:
 
 int main(int argc, char** argv) {
     std::cout << "==================================================\n";
-    std::cout << "  OPTICAL NEURAL NETWORK - DIGIT RECOGNIZER v2.0  \n";
+    std::cout << "  OPTICAL NEURAL NETWORK - RSNA / DIGITS  v2.0   \n";
     std::cout << "==================================================\n";
     std::cout << "Architecture: Interferometric Deep Learning\n";
     std::cout << "Physics: Mach-Zehnder Networks with Coherent Interference\n";
@@ -1699,6 +2281,318 @@ int main(int argc, char** argv) {
     std::cout << "==================================================\n\n";
     
     try {
+        // Auto-config: if a RSNA MIPs CSV exists and no explicit mode set, default to RSNA training.
+        auto getenv_s = [](const char* k) -> std::string { const char* v = std::getenv(k); return v ? std::string(v) : std::string(); };
+        auto ensure_env = [](const char* k, const char* val){ if (!std::getenv(k)) {
+#if defined(_WIN32)
+            _putenv_s(k, val);
+#else
+            setenv(k, val, 1);
+#endif
+        }};
+        bool explicit_mode = (std::getenv("RSNA_INFER") != nullptr) || (std::getenv("RSNA_TRAIN_MIPS") != nullptr);
+        if (!explicit_mode) {
+            namespace fs = std::filesystem;
+            // Solo autoconfig con dataset completo si existe en raíz
+            if (fs::exists("train_mips_full.csv")) {
+                // Enable non-conventional features by default
+                ensure_env("USE_MAX_PLUS", "1");
+                ensure_env("USE_HADAMARD", "1");
+                ensure_env("USE_KWTA", "1");
+                ensure_env("KWTA_FRAC", "0.10");
+                ensure_env("LI_ALPHA", "0.05");
+                ensure_env("DISABLE_EARLY_STOP", "1");
+                // Checkpoints
+                ensure_env("CKPT_DIR", "ckpt_full");
+                // Default to multi-expert training by default
+                ensure_env("MULTIEXPERT_4", "1");
+                ensure_env("CKPT_DIR_FRONT", "ckpt_front");
+                ensure_env("CKPT_DIR_BACK",  "ckpt_back");
+                ensure_env("CKPT_DIR_LEFT",  "ckpt_left");
+                ensure_env("CKPT_DIR_RIGHT", "ckpt_right");
+                // Hook RSNA training mode automatically
+                ensure_env("RSNA_TRAIN_MIPS", "1");
+                ensure_env("RSNA_MIPS_CSV", "train_mips_full.csv");
+                std::cout << "[AUTO] Detectado train_mips_full.csv -> modo RSNA activado" << std::endl;
+            }
+        }
+        // RSNA CLI quick path: if RSNA_INFER is set, run 4-view inference and exit.
+        if (std::getenv("RSNA_INFER") != nullptr) {
+            auto getenv_s = [](const char* k) -> std::string { const char* v = std::getenv(k); return v ? std::string(v) : std::string(); };
+            std::string f_front = getenv_s("RSNA_FRONT");
+            std::string f_back  = getenv_s("RSNA_BACK");
+            std::string f_left  = getenv_s("RSNA_LEFT");
+            std::string f_right = getenv_s("RSNA_RIGHT");
+            if (f_front.empty() || f_back.empty() || f_left.empty() || f_right.empty()) {
+                std::cerr << "RSNA_INFER set, but one of RSNA_FRONT/RSNA_BACK/RSNA_LEFT/RSNA_RIGHT is missing" << std::endl;
+                return 2;
+            }
+
+            auto infer_view = [&](const std::string& img_path, const std::string& ckpt) -> float {
+                int w=0,h=0; std::vector<float> img;
+                if (!load_pgm_as_gray(img_path, img, w, h)) {
+                    std::cerr << "Failed to load image: " << img_path << std::endl; return 0.5f;
+                }
+                auto in28 = formalize_and_resize_to_28x28(img, w, h);
+                OpticalNeuralNetwork net;
+                if (!ckpt.empty()) net.loadWeights(ckpt);
+                auto out = net.inferSingle(in28);
+                // Map tanh activations to [0,1] via max
+                float best = out.empty() ? 0.0f : out[0];
+                for (size_t i = 1; i < out.size(); ++i) if (out[i] > best) best = out[i];
+                float p = 0.5f * (best + 1.0f);
+                if (p < 0.0f) p = 0.0f; if (p > 1.0f) p = 1.0f;
+                return p;
+            };
+
+            std::string ck_router = getenv_s("CKPT_ROUTER"); // optional (not used here yet)
+            std::string ck_front  = getenv_s("CKPT_FRONT");
+            std::string ck_back   = getenv_s("CKPT_BACK");
+            std::string ck_left   = getenv_s("CKPT_LEFT");
+            std::string ck_right  = getenv_s("CKPT_RIGHT");
+
+            float p_front = infer_view(f_front, ck_front);
+            float p_back  = infer_view(f_back,  ck_back);
+            float p_left  = infer_view(f_left,  ck_left);
+            float p_right = infer_view(f_right, ck_right);
+
+            float present_prob = (p_front + p_back + p_left + p_right) * 0.25f;
+            // Build 15 outputs: 14 arteries + global
+            std::vector<float> probs(15, present_prob);
+            // Print as JSON line
+            std::cout << "{\"probs\":[";
+            for (int i = 0; i < 15; ++i) {
+                if (i) std::cout << ",";
+                std::cout << std::fixed << std::setprecision(6) << probs[i];
+            }
+            std::cout << "]}" << std::endl;
+            return 0;
+        }
+
+        // RSNA TRAIN from MIPs CSV: expects RSNA_TRAIN_MIPS=1 and RSNA_MIPS_CSV pointing to CSV with columns:
+        // SeriesInstanceUID,label,front,back,left,right  where label in {0,1}, paths are PGM files.
+        if (std::getenv("RSNA_TRAIN_MIPS") != nullptr) {
+            auto getenv_s = [](const char* k) -> std::string { const char* v = std::getenv(k); return v ? std::string(v) : std::string(); };
+            std::string csv_path = getenv_s("RSNA_MIPS_CSV");
+            if (csv_path.empty()) {
+                std::cerr << "RSNA_TRAIN_MIPS=1 requiere RSNA_MIPS_CSV con ruta al CSV" << std::endl;
+                return 2;
+            }
+
+            struct Sample { std::string id; int label; std::string f,b,l,r; };
+            std::vector<Sample> samples;
+            {
+                std::ifstream f(csv_path);
+                if (!f.is_open()) { std::cerr << "No se puede abrir: " << csv_path << std::endl; return 2; }
+                std::string line; std::getline(f, line); // header
+                while (std::getline(f, line)) {
+                    if (line.empty()) continue;
+                    printf("DEBUG_LINE: %s\n", line.c_str());
+                    std::stringstream ss(line);
+                    std::string id,label_s,fp1,fp2,fp3,fp4;
+                    std::getline(ss, id, ',');
+                    std::getline(ss, label_s, ',');
+                    std::getline(ss, fp1, ',');
+                    std::getline(ss, fp2, ',');
+                    std::getline(ss, fp3, ',');
+                    std::getline(ss, fp4, ',');
+                    printf("DEBUG_PATHS: front='%s', back='%s', left='%s', right='%s'\n", fp1.c_str(), fp2.c_str(), fp3.c_str(), fp4.c_str());
+                    if (id.size()==0) continue;
+                    Sample s{ id, 0, fp1, fp2, fp3, fp4 };
+                    try { s.label = std::stoi(label_s); } catch(...) { s.label = 0; }
+                    samples.push_back(std::move(s));
+                }
+            }
+            if (samples.empty()) { std::cerr << "CSV sin muestras: " << csv_path << std::endl; return 2; }
+            std::cout << "[RSNA] Series en CSV: " << samples.size() << ", fichero: " << csv_path << std::endl;
+
+            bool multi = (std::getenv("MULTIEXPERT_4") != nullptr);
+            if (!multi) {
+                std::cout << "Cargando red (fused MIPs)..." << std::endl;
+                OpticalNeuralNetwork net;
+                if (const char* lw = std::getenv("LOAD_WEIGHTS")) { net.loadWeights(lw); }
+                int max_epochs = 1000; if (const char* s = std::getenv("MAX_EPOCHS")) { try { max_epochs = std::stoi(s); } catch(...){} }
+                int max_batches = -1; if (const char* s = std::getenv("MAX_BATCHES")) { try { max_batches = std::stoi(s); } catch(...){} }
+                int bs = OpticalNeuralNetwork::BATCH_SIZE;
+                size_t idx = 0;
+                const size_t total_samples = samples.size();
+                for (int ep = 0; ep < max_epochs; ++ep) {
+                    // Optional shuffle per epoch
+                    if (std::getenv("RSNA_NO_SHUFFLE") == nullptr) {
+                        std::shuffle(samples.begin(), samples.end(), std::mt19937(1337 + ep));
+                    }
+                    std::cout << "\n[RSNA TRAIN] Epoch " << (ep+1) << "/" << max_epochs << std::endl;
+                    float epoch_loss = 0.0f; int batches = 0; size_t processed = 0;
+                    auto t_epoch0 = std::chrono::high_resolution_clock::now();
+                    double io_sec = 0.0, gpu_sec = 0.0;
+                    idx = 0;
+                    while (idx < samples.size()) {
+                        auto t_io0 = std::chrono::high_resolution_clock::now();
+                        std::vector<std::vector<float>> inputs;
+                        std::vector<float> targets;
+                        for (int b = 0; b < bs && idx < samples.size(); ++b, ++idx) {
+                            const auto& s = samples[idx];
+                            int wF=0,hF=0,wB=0,hB=0,wL=0,hL=0,wR=0,hR=0; std::vector<float> imF, imB, imL, imR;
+                            if (!load_pgm_as_gray(s.f, imF, wF, hF)) imF.assign(28*28,0.0f);
+                            if (!load_pgm_as_gray(s.b, imB, wB, hB)) imB.assign(28*28,0.0f);
+                            if (!load_pgm_as_gray(s.l, imL, wL, hL)) imL.assign(28*28,0.0f);
+                            if (!load_pgm_as_gray(s.r, imR, wR, hR)) imR.assign(28*28,0.0f);
+                            auto F = resize_nn_to_28x28(imF, wF, hF);
+                            auto B = resize_nn_to_28x28(imB, wB, hB);
+                            auto L = resize_nn_to_28x28(imL, wL, hL);
+                            auto R = resize_nn_to_28x28(imR, wR, hR);
+                            std::vector<float> fused(28*28, 0.0f);
+                            for (int i = 0; i < 28*28; ++i) fused[i] = std::max(std::max(F[i], B[i]), std::max(L[i], R[i]));
+                            inputs.push_back(std::move(fused));
+                            targets.push_back((float)(s.label != 0));
+                            if (std::getenv("RSNA_DEBUG_SAMPLES") != nullptr && b < 2 && ep == 0) {
+                                namespace fs = std::filesystem;
+                                std::cout << "  sample id=" << s.id << " front=" << fs::path(s.f).filename().string() << std::endl;
+                            }
+                        }
+                        auto t_io1 = std::chrono::high_resolution_clock::now();
+                        if (inputs.empty()) break;
+                        processed += inputs.size();
+                        double io_dur = std::chrono::duration<double>(t_io1 - t_io0).count();
+                        io_sec += io_dur;
+                        auto t_gpu0 = std::chrono::high_resolution_clock::now();
+                        float loss = net.trainBatchBinary(inputs, targets);
+                        auto t_gpu1 = std::chrono::high_resolution_clock::now();
+                        gpu_sec += std::chrono::duration<double>(t_gpu1 - t_gpu0).count();
+                        epoch_loss += loss; batches++;
+                        if (batches % 50 == 0) {
+                            std::cout << "  [progress] processed " << processed << "/" << total_samples
+                                      << ", avg_loss=" << (epoch_loss / std::max(1, batches))
+                                      << ", io=" << std::fixed << std::setprecision(2) << io_sec
+                                      << "s, gpu=" << gpu_sec << "s" << std::endl;
+                        }
+                        if (max_batches > 0 && batches >= max_batches) break;
+                    }
+                    auto t_epoch1 = std::chrono::high_resolution_clock::now();
+                    double epoch_sec = std::chrono::duration<double>(t_epoch1 - t_epoch0).count();
+                    std::cout << "[RSNA TRAIN] samples=" << processed << "/" << total_samples
+                              << ", batches=" << batches
+                              << ", avg loss=" << (epoch_loss / std::max(1, batches))
+                              << ", io=" << std::fixed << std::setprecision(2) << io_sec
+                              << "s, gpu=" << gpu_sec << "s, epoch=" << epoch_sec << "s" << std::endl;
+                    net.incrementEpoch();
+                    if (const char* ck = std::getenv("CKPT_DIR")) {
+                        std::string dir = ck; if (dir.back()=='/'||dir.back()=='\\') dir.pop_back();
+                        net.saveWeights(dir, (std::string("epoch_")+std::to_string(ep+1)+".bin"));
+                    }
+                }
+                return 0;
+            } else {
+                std::cout << "Cargando 4 expertos (front/back/left/right)..." << std::endl;
+                OpticalNeuralNetwork netF, netB, netL, netR;
+                std::string lf = getenv_s("LOAD_FRONT"), lb = getenv_s("LOAD_BACK"), ll = getenv_s("LOAD_LEFT"), lr = getenv_s("LOAD_RIGHT");
+                if (!lf.empty()) netF.loadWeights(lf); if (!lb.empty()) netB.loadWeights(lb); if (!ll.empty()) netL.loadWeights(ll); if (!lr.empty()) netR.loadWeights(lr);
+                std::string ckF = getenv_s("CKPT_DIR_FRONT"); if (ckF.empty()) ckF = "ckpt_front";
+                std::string ckB = getenv_s("CKPT_DIR_BACK");  if (ckB.empty()) ckB = "ckpt_back";
+                std::string ckL = getenv_s("CKPT_DIR_LEFT");  if (ckL.empty()) ckL = "ckpt_left";
+                std::string ckR = getenv_s("CKPT_DIR_RIGHT"); if (ckR.empty()) ckR = "ckpt_right";
+                int max_epochs = 1000; if (const char* s = std::getenv("MAX_EPOCHS")) { try { max_epochs = std::stoi(s); } catch(...){} }
+                int max_batches = -1; if (const char* s = std::getenv("MAX_BATCHES")) { try { max_batches = std::stoi(s); } catch(...){} }
+                int bs = OpticalNeuralNetwork::BATCH_SIZE;
+                size_t idx = 0;
+                for (int ep = 0; ep < max_epochs; ++ep) {
+                    if (std::getenv("RSNA_NO_SHUFFLE") == nullptr) {
+                        std::shuffle(samples.begin(), samples.end(), std::mt19937(7331 + ep));
+                    }
+                    std::cout << "\n[RSNA TRAIN 4X] Epoch " << (ep+1) << "/" << max_epochs << std::endl;
+                    float epoch_loss = 0.0f; int batches = 0; size_t processed = 0; const size_t total_samples = samples.size();
+                    auto t_epoch0 = std::chrono::high_resolution_clock::now();
+                    double io_sec = 0.0, gpu_sec = 0.0;
+                    idx = 0;
+                    while (idx < samples.size()) {
+                        auto t_io0 = std::chrono::high_resolution_clock::now();
+                        std::vector<std::vector<float>> inF, inB, inL, inR;
+                        std::vector<float> targets;
+                        for (int b = 0; b < bs && idx < samples.size(); ++b, ++idx) {
+                            const auto& s = samples[idx];
+                            int wF=0,hF=0,wB=0,hB=0,wL=0,hL=0,wR=0,hR=0; std::vector<float> imF, imB, imL, imR;
+                            bool ok = true;
+                            std::string pf = trim_and_normalize_path(s.f);
+                            std::string pb = trim_and_normalize_path(s.b);
+                            std::string pl = trim_and_normalize_path(s.l);
+                            std::string pr = trim_and_normalize_path(s.r);
+                            if (!load_pgm_as_gray(pf, imF, wF, hF)) { std::cerr << "[RSNA] Error cargando " << pf << "\n"; ok=false; }
+                            if (!load_pgm_as_gray(pb, imB, wB, hB)) { std::cerr << "[RSNA] Error cargando " << pb << "\n"; ok=false; }
+                            if (!load_pgm_as_gray(pl, imL, wL, hL)) { std::cerr << "[RSNA] Error cargando " << pl << "\n"; ok=false; }
+                            if (!load_pgm_as_gray(pr, imR, wR, hR)) { std::cerr << "[RSNA] Error cargando " << pr << "\n"; ok=false; }
+                            if (!ok) { continue; }
+                            inF.push_back(formalize_and_resize_to_28x28(imF, wF, hF));
+                            inB.push_back(formalize_and_resize_to_28x28(imB, wB, hB));
+                            inL.push_back(formalize_and_resize_to_28x28(imL, wL, hL));
+                            inR.push_back(formalize_and_resize_to_28x28(imR, wR, hR));
+                            targets.push_back((float)(s.label != 0));
+                            if (std::getenv("RSNA_DEBUG_SAMPLES") != nullptr && b < 2 && ep == 0) {
+                                namespace fs = std::filesystem;
+                                std::cout << "  sample id=" << s.id << " front=" << fs::path(s.f).filename().string() << std::endl;
+                            }
+                        }
+                        auto t_io1 = std::chrono::high_resolution_clock::now();
+                        if (targets.empty()) break;
+                        processed += targets.size();
+                        io_sec += std::chrono::duration<double>(t_io1 - t_io0).count();
+                        auto t_gpu0 = std::chrono::high_resolution_clock::now();
+                        float lf1 = netF.trainBatchBinary(inF, targets);
+                        float lb1 = netB.trainBatchBinary(inB, targets);
+                        float ll1 = netL.trainBatchBinary(inL, targets);
+                        float lr1 = netR.trainBatchBinary(inR, targets);
+                        auto t_gpu1 = std::chrono::high_resolution_clock::now();
+                        gpu_sec += std::chrono::duration<double>(t_gpu1 - t_gpu0).count();
+                        float loss = 0.25f * (lf1 + lb1 + ll1 + lr1);
+                        epoch_loss += loss; batches++;
+                        if (batches % 50 == 0) {
+                            std::cout << "  [progress] processed " << processed << "/" << total_samples
+                                      << ", avg_loss=" << (epoch_loss / std::max(1, batches))
+                                      << ", io=" << std::fixed << std::setprecision(2) << io_sec
+                                      << "s, gpu=" << gpu_sec << "s" << std::endl;
+                        }
+                        if (max_batches > 0 && batches >= max_batches) break;
+                    }
+                    auto t_epoch1 = std::chrono::high_resolution_clock::now();
+                    double epoch_sec = std::chrono::duration<double>(t_epoch1 - t_epoch0).count();
+                    std::cout << "[RSNA TRAIN 4X] samples=" << processed << "/" << total_samples
+                              << ", batches=" << batches
+                              << ", avg loss=" << (epoch_loss / std::max(1, batches))
+                              << ", io=" << std::fixed << std::setprecision(2) << io_sec
+                              << "s, gpu=" << gpu_sec << "s, epoch=" << epoch_sec << "s" << std::endl;
+                    if (processed == 0) {
+                        std::cerr << "[RSNA] Ninguna muestra valida procesada en la epoca. Aborting. Verifique rutas en RSNA_MIPS_CSV." << std::endl;
+                        return 2;
+                    }
+                    netF.incrementEpoch(); netB.incrementEpoch(); netL.incrementEpoch(); netR.incrementEpoch();
+                    netF.saveWeights(ckF, (std::string("epoch_") + std::to_string(ep+1) + ".bin"));
+                    netB.saveWeights(ckB, (std::string("epoch_") + std::to_string(ep+1) + ".bin"));
+                    netL.saveWeights(ckL, (std::string("epoch_") + std::to_string(ep+1) + ".bin"));
+                    netR.saveWeights(ckR, (std::string("epoch_") + std::to_string(ep+1) + ".bin"));
+                }
+                return 0;
+            }
+        }
+        // If we reach here, no RSNA mode has been selected. To avoid accidental fallback
+        // to the legacy MNIST/Digits path, require explicit opt-in via LEGACY_DIGITS=1.
+        if (std::getenv("LEGACY_DIGITS") == nullptr) {
+            std::cerr << "\n==================================================\n";
+            std::cerr << "ERROR: Modo RSNA no configurado correctamente\n";
+            std::cerr << "==================================================\n";
+            std::cerr << "Para entrenar con el dataset RSNA:\n";
+            std::cerr << "1. Genere el archivo 'train_mips.csv' con las rutas de las imágenes MIP\n";
+            std::cerr << "2. O establezca variables de entorno:\n";
+            std::cerr << "   RSNA_TRAIN_MIPS=1\n";
+            std::cerr << "   RSNA_MIPS_CSV=ruta/al/archivo.csv\n";
+            std::cerr << "\nPara inferencia RSNA:\n";
+            std::cerr << "   RSNA_INFER=1\n";
+            std::cerr << "   RSNA_FRONT=ruta/imagen_front.pgm\n";
+            std::cerr << "   RSNA_BACK=ruta/imagen_back.pgm\n";
+            std::cerr << "   RSNA_LEFT=ruta/imagen_left.pgm\n";
+            std::cerr << "   RSNA_RIGHT=ruta/imagen_right.pgm\n";
+            std::cerr << "\nPara usar el flujo legado de dígitos, establezca LEGACY_DIGITS=1\n";
+            std::cerr << "==================================================\n" << std::endl;
+            return 2;
+        }
         // Check CUDA
         int device_count;
         CUDA_CHECK(cudaGetDeviceCount(&device_count));
@@ -1727,12 +2621,20 @@ int main(int argc, char** argv) {
         // Initialize network
         std::cout << "\nInitializing optical network...\n";
         OpticalNeuralNetwork network;
+        if (const char* s = std::getenv("LOAD_WEIGHTS")) {
+            std::cout << "Attempting to load checkpoint: " << s << std::endl;
+            if (!network.loadWeights(s)) {
+                std::cout << "Failed to load weights from '" << s << "'. Continuing with initialized weights.\n";
+            } else {
+                std::cout << "Loaded weights from checkpoint.\n";
+            }
+        }
         
         // Initialize trainer
         Trainer trainer(network, loader);
         
         // Training (can be skipped with PREDICT_ONLY)
-        int max_epochs = 99;
+        int max_epochs = 999;
         if (const char* env_me = std::getenv("MAX_EPOCHS")) {
             try { max_epochs = std::stoi(env_me); } catch (...) {}
         }
@@ -1743,10 +2645,11 @@ int main(int argc, char** argv) {
         auto start_time = std::chrono::high_resolution_clock::now();
         
         if (std::getenv("PREDICT_ONLY") == nullptr) {
+            bool disable_es = (std::getenv("DISABLE_EARLY_STOP") != nullptr);
             for (int epoch = 0; epoch < max_epochs; epoch++) {
                 std::cout << "\n--- Epoch " << (epoch + 1) << "/" << max_epochs << " ---\n";
                 trainer.trainEpoch();
-                if (!trainer.isImproving() && epoch > 5) {
+                if (!disable_es && !trainer.isImproving() && epoch > 5) {
                     std::cout << "Early stopping - loss not improving\n";
                     break;
                 }
