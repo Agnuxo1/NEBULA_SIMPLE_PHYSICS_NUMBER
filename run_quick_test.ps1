@@ -37,5 +37,22 @@ if (-not $p.HasExited) {
   exit 124
 } else {
   Write-Host "[run_quick_test] Finished. ExitCode=$($p.ExitCode)"
-  exit $p.ExitCode
+  if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+  $jsonPath = Join-Path $workdir 'output.json'
+  if (-not (Test-Path $jsonPath)) {
+    Write-Error "[run_quick_test] output.json not found"
+    exit 1
+  }
+  try {
+    $content = Get-Content $jsonPath -Raw | ConvertFrom-Json
+  } catch {
+    Write-Error "[run_quick_test] invalid JSON format"
+    exit 1
+  }
+  if (-not $content.probs) {
+    Write-Error "[run_quick_test] 'probs' field missing"
+    exit 1
+  }
+  Write-Host "[run_quick_test] JSON output validated"
+  exit 0
 }
